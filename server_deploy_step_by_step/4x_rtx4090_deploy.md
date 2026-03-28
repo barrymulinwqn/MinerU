@@ -57,7 +57,7 @@ Running both in one process on one GPU wastes three idle GPUs. The architecture 
 
 **Why this split maximises throughput on this hardware:**
 
-1. **RTX 4090 has 24 GB VRAM.** The VLM model (`MinerU2.5-2509-1.2B`, ~2.5 GB loaded weight) uses at most ~8–10 GB with vllm KV cache at `gpu_memory_utilization=0.8`. The pipeline CV models load ~1–2 GB. There is headroom to run multiple concurrent workers per GPU.
+1. **RTX 4090 has 24 GB VRAM.** `gpu_memory_utilization=0.80` reserves 80% of total card VRAM for the **entire vllm process** (model weights + KV cache combined): 24 × 0.80 = **19.2 GB** total vllm budget. The ~2.5 GB loaded model weights are subtracted from that budget, leaving ~**16.7 GB** for the KV cache; the remaining ~4.8 GB covers the CUDA context and PyTorch allocator overhead. Pipeline CV models consume an additional ~1–2 GB on GPU 0–1. There is ample headroom for multiple concurrent workers per GPU.
 
 2. **16 CPU cores / 32 threads.** The pipeline post-processing (OCR text assembly, table merging, reading-order, markdown rendering) is CPU-bound. 16 cores can comfortably serve 4–8 concurrent pipeline workers without saturation.
 
@@ -77,14 +77,36 @@ lsb_release -a
 
 # 2. Install NVIDIA driver 570+ (Ada Lovelace / RTX 4090 requires ≥ 525)
 sudo apt-get install -y linux-headers-$(uname -r)
-# Option A: Ubuntu package
+```
+
+**Option A — Ubuntu package (simplest):**
+
+```bash
 sudo apt-get install -y nvidia-driver-570
 
-# Option B: NVIDIA runfile (recommended for production)
-# Download from https://www.nvidia.com/Download/index.aspx
-# chmod +x NVIDIA-Linux-x86_64-570.*.run && sudo ./NVIDIA-Linux-x86_64-570.*.run
+# The nouveau open-source driver must be explicitly blacklisted.
+# The apt package creates /etc/modprobe.d/nvidia-installer-disable-nouveau.conf
+# but on some Ubuntu variants this is insufficient.
+echo 'blacklist nouveau\noptions nouveau modeset=0' | sudo tee /etc/modprobe.d/blacklist-nouveau.conf
+sudo update-initramfs -u
 
-# 3. Verify all 4 GPUs visible
+# A full reboot is REQUIRED — the NVIDIA kernel module is not active until then.
+sudo reboot
+# After reboot, confirm nouveau is gone and NVIDIA is loaded:
+lsmod | grep nouveau   # should return empty
+nvidia-smi             # should show 4× RTX 4090
+```
+
+**Option B — NVIDIA runfile (recommended for production, cleaner uninstall path):**
+
+```bash
+# Download from https://www.nvidia.com/Download/index.aspx
+# sudo bash NVIDIA-Linux-x86_64-570.*.run --no-opengl-files
+# sudo reboot
+```
+
+```bash
+# 3. Verify all 4 GPUs visible after reboot
 nvidia-smi
 # Expected: 4× RTX 4090, driver ≥ 525, CUDA ≥ 12.1
 
@@ -95,7 +117,7 @@ sudo apt-get install -y cuda-toolkit-12-4
 sudo nvidia-smi -pm 1
 
 # 6. Set GPU power limit and clocks for sustained throughput
-sudo nvidia-smi --power-limit=450 -i 0,1,2,3     # RTX 4090 TDP 450W
+sudo nvidia-smi --power-limit=450 -i 0,1,2,3     # RTX 4090 TDP is 450W
 sudo nvidia-smi --auto-boost-default=0 -i 0,1,2,3
 ```
 
@@ -128,8 +150,13 @@ source /opt/mineru/venv/bin/activate
 pip install --upgrade pip
 pip install uv
 
-# Install MinerU with full GPU extras (includes vllm, lmdeploy)
+# Install MinerU core (layout models, OCR, pipeline stack)
 uv pip install -U "mineru[core]"
+
+# Install vllm explicitly — mineru[core] does NOT pull it in automatically.
+# Pin to the same version used in the production Dockerfile.
+# Verify the pin first: grep 'vllm' docker/global/Dockerfile
+uv pip install "vllm==0.10.1.1"
 
 # Install LitServe for the multi-GPU worker server
 uv pip install litserve aiohttp loguru
@@ -144,15 +171,29 @@ python -c "import torch; print(torch.cuda.device_count())"
 ## Step 3 — Download Models
 
 ```bash
-# Set MINERU_MODEL_SOURCE in advance to avoid runtime downloads
+activate /opt/mineru/venv
 source /opt/mineru/venv/bin/activate
 
-# Download all models (pipeline + VLM) to the default HuggingFace cache
+# Set a shared model cache directory BEFORE downloading.
+# This ensures the paths written into mineru.json point to a location
+# that the mineru service user can read (ownership set below).
+export HF_HOME=/opt/mineru/models
+sudo mkdir -p /opt/mineru/models
+
+# Download all models (pipeline + VLM)
 mineru-models-download -s huggingface -m all
 
-# Verify the config file was written
+# Verify the config was written correctly
 cat ~/.mineru.json
-# Should show "models-dir" paths for both "pipeline" and "vlm"
+# "models-dir" paths should reference /opt/mineru/models/...
+
+# Stage the config in the shared location used by the systemd service user.
+# The environment variable MINERU_TOOLS_CONFIG_JSON (set in systemd unit files
+# in Step 9) points here.
+sudo cp ~/.mineru.json /opt/mineru/mineru.json
+
+# Grant the mineru service user ownership of all shared assets.
+sudo chown -R mineru:mineru /opt/mineru/models /opt/mineru/mineru.json
 ```
 
 > **Tip — China network:** Replace `-s huggingface` with `-s modelscope` and set:
@@ -214,7 +255,7 @@ mineru-openai-server \
 |---|---|---|
 | `CUDA_VISIBLE_DEVICES=2,3` | GPU 2 and 3 | Isolate VLM server; GPU 0–1 reserved for pipeline |
 | `--data-parallel-size 2` | 2 | One shard per GPU; doubles VLM throughput vs single GPU |
-| `--gpu-memory-utilization 0.80` | 0.80 | RTX 4090 24 GB × 0.80 = ~19 GB for KV cache; the 2.5 GB model leaves ~21 GB free — 0.80 is safe and keeps VRAM for large-page batches |
+| `--gpu-memory-utilization` | 0.80 | 24 × 0.80 = 19.2 GB total vllm budget (weights + KV cache). ~2.5 GB used by model weights → ~16.7 GB for KV cache. Remaining ~4.8 GB for CUDA context overhead. |
 | `--host 127.0.0.1` | loopback | Never expose VLM inference port to public network |
 
 **Health check:**
@@ -232,6 +273,7 @@ Create `/opt/mineru/server.py`:
 
 ```python
 import os
+import uuid
 import base64
 import tempfile
 from pathlib import Path
@@ -257,7 +299,10 @@ class MinerUAPI(ls.LitAPI):
         device_mode = os.environ["MINERU_DEVICE_MODE"]
         if not os.getenv("MINERU_VIRTUAL_VRAM_SIZE"):
             vram = get_vram(device_mode) if device_mode.startswith(("cuda", "npu")) else 1
-            os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = str(vram)
+            # workers_per_device=2: two workers share the same physical GPU (24 GB).
+            # Report half so MinerU's batch-size logic does not over-allocate
+            # and trigger OOM when both workers run concurrently.
+            os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = str(max(1, vram // 2))
         os.environ.setdefault("MINERU_MODEL_SOURCE", "local")
         os.environ.setdefault("MINERU_PDF_RENDER_THREADS", "8")
         logger.info(
@@ -289,9 +334,13 @@ class MinerUAPI(ls.LitAPI):
         output_dir = Path(self.output_dir)
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
+            # Append a short unique ID so concurrent workers processing files
+            # with the same filename never write to the same subdirectory.
+            job_id = str(uuid.uuid4())[:8]
+            unique_name = f"{input_path.stem}_{job_id}"
             do_parse(
                 output_dir=str(output_dir),
-                pdf_file_names=[input_path.stem],
+                pdf_file_names=[unique_name],
                 pdf_bytes_list=[read_fn(input_path)],
                 p_lang_list=[inputs["lang"]],
                 backend=inputs["backend"],
@@ -302,7 +351,7 @@ class MinerUAPI(ls.LitAPI):
                 start_page_id=inputs["start_page_id"],
                 end_page_id=inputs["end_page_id"],
             )
-            return str(output_dir / input_path.stem)
+            return str(output_dir / unique_name)
         except Exception as exc:
             logger.error(f"Processing failed: {exc}")
             raise HTTPException(status_code=500, detail=str(exc))
@@ -375,16 +424,21 @@ upstream mineru_workers {
 }
 
 server {
-    listen 80;                   # Or 443 with TLS — strongly recommended for production
+    # Bind ONLY to the 10 GbE interface (AQC113C) by replacing _ with the NIC's IP.
+    # "listen 80;" without an IP binds on all interfaces, including the 1 GbE Intel
+    # I210 and any Docker bridge. In production, set this to the specific IP:
+    #   listen 10.x.x.x:80;     # Replace with actual AQC113C IP
+    # Or terminate TLS here (strongly recommended):
+    #   listen 10.x.x.x:443 ssl;
+    listen 80;
     server_name _;
 
-    # Bind production traffic to 10 GbE NIC
-    # listen 10.x.x.x:80;       # Replace with actual 10 GbE IP
-
     client_max_body_size 512M;   # Allow large PDF uploads
-    client_body_timeout 300s;
-    proxy_read_timeout  300s;
-    proxy_send_timeout  300s;
+    client_body_timeout 900s;
+    # 900s allows a 500-page scientific PDF with formulas/tables to complete.
+    # LitServe workers have timeout=False; nginx is the binding constraint.
+    proxy_read_timeout  900s;
+    proxy_send_timeout  900s;
 
     location / {
         proxy_pass         http://mineru_workers;
@@ -424,6 +478,7 @@ WorkingDirectory=/opt/mineru
 Environment=PATH=/opt/mineru/venv/bin:/usr/local/bin:/usr/bin:/bin
 Environment=CUDA_VISIBLE_DEVICES=2,3
 Environment=MINERU_MODEL_SOURCE=local
+Environment=MINERU_TOOLS_CONFIG_JSON=/opt/mineru/mineru.json
 ExecStart=/opt/mineru/venv/bin/mineru-openai-server \
     --host 127.0.0.1 \
     --port 30000 \
@@ -449,7 +504,8 @@ Create `/etc/systemd/system/mineru-pipeline.service`:
 [Unit]
 Description=MinerU Pipeline Worker Server (LitServe, GPUs 0-1)
 After=network.target mineru-vlm.service
-Wants=mineru-vlm.service
+# Hard dependency: if the VLM service is not running, this service will not start.
+Requires=mineru-vlm.service
 
 [Service]
 Type=simple
@@ -459,7 +515,15 @@ WorkingDirectory=/opt/mineru
 Environment=PATH=/opt/mineru/venv/bin:/usr/local/bin:/usr/bin:/bin
 Environment=CUDA_VISIBLE_DEVICES=0,1
 Environment=MINERU_MODEL_SOURCE=local
+Environment=MINERU_TOOLS_CONFIG_JSON=/opt/mineru/mineru.json
 Environment=MINERU_PDF_RENDER_THREADS=8
+# Report half the physical VRAM (12 GB) because workers_per_device=2 means
+# two workers share the same 24 GB GPU. This prevents batch-size over-allocation.
+Environment=MINERU_VIRTUAL_VRAM_SIZE=12
+# Block startup until the VLM server's /health endpoint responds.
+# vllm model loading takes 30-60 s; without this probe, early requests fail.
+ExecStartPre=/bin/bash -c \
+    'until curl -sf http://127.0.0.1:30000/health; do echo "Waiting for VLM server..."; sleep 5; done'
 ExecStart=/opt/mineru/venv/bin/python /opt/mineru/server.py
 Restart=on-failure
 RestartSec=15s
@@ -474,14 +538,18 @@ WantedBy=multi-user.target
 ```
 
 ```bash
-# Create service user
+# Create the shared directory first, then create the service user.
+# (useradd --home sets /etc/passwd but does NOT create the directory)
+sudo mkdir -p /opt/mineru
 sudo useradd --system --home /opt/mineru --shell /usr/sbin/nologin mineru
+
+# Transfer ownership of all shared assets downloaded in Step 3.
 sudo chown -R mineru:mineru /opt/mineru
 
 # Enable and start services
 sudo systemctl daemon-reload
 sudo systemctl enable --now mineru-vlm.service
-# Wait ~30 s for VLM server to load models, then:
+# The pipeline service waits automatically via ExecStartPre health probe.
 sudo systemctl enable --now mineru-pipeline.service
 
 # Verify
@@ -495,6 +563,22 @@ journalctl -u mineru-vlm.service -f
 ## Step 10 — Docker Alternative (Self-Contained)
 
 If you prefer Docker over bare-metal Python:
+
+### 10.0 Prerequisites — nvidia-container-toolkit
+
+Docker GPU passthrough requires `nvidia-container-toolkit` on the host:
+
+```bash
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+    sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+    sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+# Verify Docker can see GPUs:
+docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
+```
 
 ### 10.1 Build the Image (bake models in)
 
@@ -529,6 +613,14 @@ services:
       memlock: -1
       stack: 67108864
     ipc: host
+    # Healthcheck gates mineru-api startup: the VLM model takes 30-60 s to load.
+    # Without this, mineru-api starts sending requests before vllm is ready.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:30000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
     deploy:
       resources:
         reservations:
@@ -542,7 +634,8 @@ services:
     container_name: mineru-api
     restart: always
     depends_on:
-      - mineru-vlm
+      mineru-vlm:
+        condition: service_healthy   # Wait until VLM model finishes loading
     entrypoint: mineru-api
     command:
       - --host
@@ -552,8 +645,8 @@ services:
     environment:
       MINERU_MODEL_SOURCE: local
       MINERU_API_MAX_CONCURRENT_REQUESTS: "4"
-      # Point hybrid-http-client at the VLM container
-      # Pass via request parameter: server_url=http://mineru-vlm:30000/v1
+      # Pass server_url per request: server_url=http://mineru-vlm:30000/v1
+      # Docker bridge DNS resolves the container name "mineru-vlm".
     ports:
       - "8000:8000"
     ulimits:
@@ -587,8 +680,9 @@ docker compose logs -f
 CUDA_VISIBLE_DEVICES=0,1          # pipeline server
 CUDA_VISIBLE_DEVICES=2,3          # VLM server
 
-# VRAM headroom — RTX 4090 reports 24576 MB; set slightly below for safety
-MINERU_VIRTUAL_VRAM_SIZE=24       # reported to batch sizing logic
+# VRAM per pipeline worker — with workers_per_device=2, two workers share each
+# physical GPU (24 GB). Report half to prevent batch-size logic from over-allocating.
+MINERU_VIRTUAL_VRAM_SIZE=12       # 24 GB ÷ 2 workers per GPU
 
 # Pipeline batch: 384 pages/batch (default) is good; increase if RAM allows
 MINERU_MIN_BATCH_INFERENCE_SIZE=512
@@ -608,12 +702,14 @@ MINERU_LOG_LEVEL=WARNING
 
 ### vllm GPU Utilisation Guide
 
-| `--gpu-memory-utilization` | KV cache allocation (24 GB card) | When to use |
-|---|---|---|
-| 0.90 | ~22 GB | Single large-document jobs, no concurrent requests |
-| **0.80** | **~19 GB** | **Recommended — 2–4 concurrent page batches** |
-| 0.70 | ~17 GB | Conservative; more headroom for OS/CUDA overhead |
-| 0.50 | ~12 GB | Debugging / memory leak investigation |
+`gpu_memory_utilization` controls the **total** vllm VRAM budget (model weights + KV cache). Subtract ~2.5 GB model weight overhead to get the actual KV cache size.
+
+| `--gpu-memory-utilization` | Total vllm VRAM budget (24 GB card) | KV cache (budget − 2.5 GB weights) | When to use |
+|---|---|---|---|
+| 0.90 | ~21.6 GB | ~19.1 GB | Single large-document jobs, no concurrent requests |
+| **0.80** | **~19.2 GB** | **~16.7 GB** | **Recommended — 2–4 concurrent page batches** |
+| 0.70 | ~16.8 GB | ~14.3 GB | Conservative; extra OS/CUDA headroom |
+| 0.50 | ~12.0 GB | ~9.5 GB | Debugging / memory leak investigation |
 
 ---
 
@@ -626,12 +722,27 @@ nvtop
 watch -n 1 nvidia-smi
 
 # Service logs
-journalctl -u mineru-vlm -f
-journalctl -u mineru-pipeline -f
+journalctl -u mineru-vlm.service -f
+journalctl -u mineru-pipeline.service -f
+```
 
-# Quick throughput test — submit 4 PDFs simultaneously
+**Load test — LitServe server (Step 6):** uses `POST /predict` with a JSON body.
+
+```bash
+FILE_B64=$(base64 -w 0 demo/pdfs/demo3.pdf)
 for i in 1 2 3 4; do
-    curl -s -X POST http://localhost:8000/file_parse \
+    curl -s -X POST http://localhost:8000/predict \
+        -H 'Content-Type: application/json' \
+        -d "{\"file\": \"$FILE_B64\", \"options\": {\"backend\": \"hybrid-http-client\", \"server_url\": \"http://127.0.0.1:30000/v1\"}}" &
+done
+wait
+```
+
+**Load test — FastAPI server (Step 7):** uses `POST /file_parse` with multipart form.
+
+```bash
+for i in 1 2 3 4; do
+    curl -s -X POST http://localhost:8080/file_parse \
         -F "files=@demo/pdfs/demo3.pdf" \
         -F "backend=hybrid-http-client" \
         -F "server_url=http://127.0.0.1:30000/v1" &
@@ -652,9 +763,9 @@ wait
 |---|---|---|---|---|---|
 | 0 | Pipeline + CV models | LitServe worker A1 & A2 | 2 | ~4 GB | 60–80% |
 | 1 | Pipeline + CV models | LitServe worker B1 & B2 | 2 | ~4 GB | 60–80% |
-| 2 | VLM inference shard 0 | vllm data-parallel | 1 | ~19 GB | 85–95% |
-| 3 | VLM inference shard 1 | vllm data-parallel | 1 | ~19 GB | 85–95% |
-| **Total** | | | **4–6 concurrent jobs** | **~46 GB / 96 GB** | |
+| 2 | VLM inference shard 0 | vllm data-parallel | 1 | 19.2 GB budget / ~16.7 GB KV cache | 85–95% |
+| 3 | VLM inference shard 1 | vllm data-parallel | 1 | 19.2 GB budget / ~16.7 GB KV cache | 85–95% |
+| **Total** | | | **4 concurrent jobs** | **~42 GB / 96 GB** | |
 
 ---
 
@@ -668,3 +779,205 @@ wait
 | `HTTP 503` from API | `MINERU_API_MAX_CONCURRENT_REQUESTS` too low | Increase to 16 or 0 (unlimited) |
 | GPU 0/1 idle, GPU 2/3 saturated | All requests use VLM-only path | Mix in `pipeline` backend requests or increase `workers_per_device` |
 | `nvidia-smi` shows only 1 GPU in container | Missing `device_ids` in compose | Add all required IDs under `deploy.resources.reservations.devices` |
+
+---
+
+## Step 13 — Post-Deployment Quick Testing
+
+Run these checks in order after completing Steps 0–12. Each section is self-contained — failures here pinpoint exactly which layer has a problem.
+
+### 13.1 Hardware & Driver Layer
+
+```bash
+# All 4 GPUs must appear
+nvidia-smi
+# Expected: 4× RTX 4090, CUDA Version ≥ 12.1, driver ≥ 525
+
+# All GPUs must show zero memory used (nothing running yet)
+nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv
+# Expected: each row ~0 MiB used, ~24576 MiB free
+
+# Confirm persistence mode is active
+nvidia-smi -q | grep 'Persistence Mode'
+# Expected: Enabled (all 4 GPUs)
+```
+
+### 13.2 Python / CUDA Layer
+
+```bash
+source /opt/mineru/venv/bin/activate
+
+# PyTorch must see all 4 GPUs
+python -c "import torch; print('GPUs:', torch.cuda.device_count()); \
+    [print(f'  GPU {i}:', torch.cuda.get_device_name(i)) for i in range(torch.cuda.device_count())]"
+# Expected: GPUs: 4
+
+# vllm must import cleanly
+python -c "import vllm; print('vllm:', vllm.__version__)"
+
+# MinerU must import cleanly
+python -c "from mineru.cli.common import do_parse; print('MinerU OK')"
+```
+
+### 13.3 VLM Server (GPUs 2–3)
+
+```bash
+# Check the service is running
+sudo systemctl status mineru-vlm.service
+
+# Health endpoint must return {"status":"healthy"}
+curl -s http://127.0.0.1:30000/health
+# Expected: {"status":"healthy"}
+
+# List available models (confirms vllm loaded MinerU2.5 successfully)
+curl -s http://127.0.0.1:30000/v1/models | python3 -m json.tool
+# Expected: a models list containing the MinerU2.5 model id
+
+# GPU memory check: GPU 2 and 3 should show ~19 GB used (vllm loaded)
+nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
+# Expected: GPU 2 ~19000 MiB, GPU 3 ~19000 MiB, GPU 0/1 near 0
+```
+
+### 13.4 Single PDF Parse — VLM Path
+
+```bash
+# Parse one page using the VLM server directly (vlm-http-client)
+mineru \
+    -p demo/pdfs/demo3.pdf \
+    -o /tmp/test_vlm_output \
+    -b vlm-http-client \
+    -u http://127.0.0.1:30000/v1 \
+    -e 0          # first page only for speed
+
+# Check output exists
+ls /tmp/test_vlm_output/demo3/
+# Expected: demo3.md  plus images/ directory
+
+# Spot-check the markdown is non-empty
+wc -l /tmp/test_vlm_output/demo3/demo3.md
+# Expected: > 5 lines
+```
+
+### 13.5 Single PDF Parse — Pipeline Path
+
+```bash
+# Parse one page using pipeline backend only (CV models, no VLM)
+MINERU_VIRTUAL_VRAM_SIZE=12 \
+CUDA_VISIBLE_DEVICES=0 \
+mineru \
+    -p demo/pdfs/demo3.pdf \
+    -o /tmp/test_pipeline_output \
+    -b pipeline \
+    -e 0
+
+ls /tmp/test_pipeline_output/demo3/
+wc -l /tmp/test_pipeline_output/demo3/demo3.md
+```
+
+### 13.6 LitServe Worker Server
+
+```bash
+# Start the pipeline server in the foreground for testing
+CUDA_VISIBLE_DEVICES=0,1 \
+MINERU_MODEL_SOURCE=local \
+MINERU_VIRTUAL_VRAM_SIZE=12 \
+python /opt/mineru/server.py &
+SERVER_PID=$!
+sleep 5   # wait for LitServe to bind
+
+# Send one request
+FILE_B64=$(base64 -w 0 demo/pdfs/demo3.pdf)
+RESPONSE=$(curl -s -X POST http://localhost:8000/predict \
+    -H 'Content-Type: application/json' \
+    -d "{\"file\": \"$FILE_B64\", \"options\": {\
+        \"backend\": \"hybrid-http-client\",\
+        \"server_url\": \"http://127.0.0.1:30000/v1\"\
+    }}")
+echo "Response: $RESPONSE"
+# Expected: {"output_dir": "/tmp/mineru_output/demo3_XXXXXXXX"}
+
+# Verify the output directory exists and contains markdown
+OUTDIR=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['output_dir'])")
+ls "$OUTDIR"
+
+kill $SERVER_PID
+```
+
+### 13.7 Concurrent Load Test (4 PDFs in Parallel)
+
+```bash
+# Use the systemd service (must be running from Step 9)
+FILE_B64=$(base64 -w 0 demo/pdfs/demo3.pdf)
+
+START=$(date +%s)
+for i in 1 2 3 4; do
+    curl -s -X POST http://localhost:8000/predict \
+        -H 'Content-Type: application/json' \
+        -d "{\"file\": \"$FILE_B64\", \"options\": {\
+            \"backend\": \"hybrid-http-client\",\
+            \"server_url\": \"http://127.0.0.1:30000/v1\"\
+        }}" > /tmp/result_$i.json &
+done
+wait
+END=$(date +%s)
+echo "4 concurrent jobs finished in $((END - START)) seconds"
+
+# All 4 must have succeeded
+for i in 1 2 3 4; do
+    cat /tmp/result_$i.json
+done
+
+# During the run, GPU utilisation should match the Summary table:
+# GPU 0,1: 60-80% SM  GPU 2,3: 85-95% SM
+# Check live in a second terminal:
+#   watch -n 1 nvidia-smi
+```
+
+### 13.8 Service Restart Resilience
+
+```bash
+# Simulate VLM server crash and verify pipeline auto-recovers
+sudo systemctl restart mineru-vlm.service
+
+# Pipeline service must not start accepting requests until VLM is healthy.
+# journalctl output should show "Waiting for VLM server..." lines from ExecStartPre.
+journalctl -u mineru-pipeline.service -f --since "1 min ago"
+# Expected log sequence:
+#   Waiting for VLM server...
+#   Waiting for VLM server...   (repeats ~6-12 times)
+#   Starting MinerU LitServe pipeline server on port 8000
+
+# Confirm both services are Active after restart
+sudo systemctl status mineru-vlm.service mineru-pipeline.service
+```
+
+### 13.9 Nginx Gateway (if deployed)
+
+```bash
+# Confirm nginx resolves to the LitServe server
+curl -s -o /dev/null -w "%{http_code}" http://localhost/
+# Expected: 200 (LitServe root) or 404 (path not found, but nginx connected)
+
+# Full end-to-end via nginx
+FILE_B64=$(base64 -w 0 demo/pdfs/demo3.pdf)
+curl -s -X POST http://localhost/predict \
+    -H 'Content-Type: application/json' \
+    -d "{\"file\": \"$FILE_B64\", \"options\": {\"backend\": \"hybrid-http-client\", \"server_url\": \"http://127.0.0.1:30000/v1\"}}"
+```
+
+### 13.10 Quick Checklist
+
+| # | Test | Pass Condition |
+|---|---|---|
+| 1 | `nvidia-smi` shows 4 GPUs | All 4 RTX 4090 visible, driver ≥ 525 |
+| 2 | `torch.cuda.device_count()` | Returns `4` |
+| 3 | `vllm` imports | No `ModuleNotFoundError` |
+| 4 | VLM server `/health` | `{"status":"healthy"}` |
+| 5 | VLM `/v1/models` | MinerU2.5 model listed |
+| 6 | GPU 2/3 VRAM after VLM load | ~19 GB used per card |
+| 7 | Single PDF — VLM path | Markdown output ≥ 5 lines |
+| 8 | Single PDF — pipeline path | Markdown output ≥ 5 lines |
+| 9 | LitServe single request | `output_dir` in JSON response |
+| 10 | 4 concurrent jobs | All return success, ≤ 4× sequential time |
+| 11 | Service restart | Pipeline waits for VLM; no early failures |
+| 12 | Nginx gateway | HTTP 200 end-to-end |
