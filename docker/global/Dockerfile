@@ -1,7 +1,7 @@
 # Use the official vllm image for gpu with Ampere、Ada Lovelace、Hopper architecture (8.0 <= Compute Capability <= 9.0)
 # Compute Capability version query (https://developer.nvidia.com/cuda-gpus)
 # only support x86_64 architecture
-FROM vllm/vllm-openai:v0.10.1.1
+FROM vllm/vllm-openai:cu130-nightly-148a5c1226f8668cb52c4900b5ff2c80344e78f2
 
 # Use the official vllm image for gpu with Volta、Turing、Blackwell architecture (7.0 < Compute Capability < 8.0 or Compute Capability >= 10.0)
 # support x86_64 architecture and ARM(AArch64) architecture
