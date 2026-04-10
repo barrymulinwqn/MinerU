@@ -1,4 +1,5 @@
 """
+调有代码 最终版
 Batch download PDF files from S3 to local storage.
 Lists all PDFs under INPUT_S3 and downloads them in parallel workers.
 """
@@ -18,7 +19,13 @@ LOCAL_ROOT = "/home/orbit_user/mineru"
 OUTPUT_DIR = "/home/orbit_user/mineru/netmind_check"
 MINERU_OUTPUT_DIR = "/home/orbit_user/mineru/output"
 BATCH_SIZE = 100  # number of files per batch
-GPU_COUNT = 4
+GPU_COUNT = 2
+GPU_MEM_UTIL = 0.85
+PROCESSING_WINDOW_SIZE = 16
+MAX_CONCURRENT_REQUESTS = (
+    8  # mineru API max concurrent requests (vLLM async engine concurrency)
+)
+NUM_THREADS = 4  # threads per mineru worker for CPU-bound tasks
 NUM_WORKERS = 16  # parallel download threads
 
 # ---------------------------------------------------------------------------
@@ -140,6 +147,9 @@ def process_local_pdfs_with_mineru():
     cuda_devices = ",".join(str(i) for i in range(GPU_COUNT))
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = cuda_devices
+    env["MINERU_PROCESSING_WINDOW_SIZE"] = str(PROCESSING_WINDOW_SIZE)
+    env["MINERU_API_MAX_CONCURRENT_REQUESTS"] = str(MAX_CONCURRENT_REQUESTS)
+    env["OMP_NUM_THREADS"] = str(NUM_THREADS)
 
     # Process the whole directory in one mineru call so the vLLM engine is
     # initialised exactly once and all PDFs are fed through it sequentially.
@@ -151,12 +161,15 @@ def process_local_pdfs_with_mineru():
         MINERU_OUTPUT_DIR,
         "-b",
         "vlm-auto-engine",
+        "--gpu-memory-utilization",
+        str(GPU_MEM_UTIL),
         "--data-parallel-size",
         str(GPU_COUNT),
     ]
     logger.info(
         "Running mineru on directory: CUDA_VISIBLE_DEVICES=%s %s",
         cuda_devices,
+        env["MINERU_PROCESSING_WINDOW_SIZE"],
         " ".join(cmd),
     )
     try:
